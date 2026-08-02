@@ -1,0 +1,11 @@
+/bin/
+/dist/
+*.tfplan
+*.tfstate
+*.tfstate.*
+!testdata/**/*.tfstate.json
+*.sarif
+coverage.out
+.DS_Store
+.idea/
+.vscode/

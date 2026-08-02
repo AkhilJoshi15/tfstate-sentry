@@ -1,0 +1,42 @@
+{
+  "version": 4,
+  "terraform_version": "1.11.4",
+  "serial": 1,
+  "lineage": "synthetic-lineage",
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_db_instance",
+      "name": "main",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 2,
+          "attributes": {
+            "identifier": "synthetic-db",
+            "username": "synthetic-admin",
+            "password": "synthetic-password-not-valid",
+            "endpoint": "postgres://synthetic-user:synthetic-pass@db.example.invalid:5432/app"
+          },
+          "sensitive_attributes": [["password"]]
+        }
+      ]
+    },
+    {
+      "mode": "managed",
+      "type": "tls_private_key",
+      "name": "example",
+      "provider": "provider[\"registry.terraform.io/hashicorp/tls\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "algorithm": "RSA",
+            "private_key_pem": "-----BEGIN PRIVATE KEY-----\nSYNTHETIC-TEST-DATA-ONLY\n-----END PRIVATE KEY-----"
+          },
+          "sensitive_attributes": []
+        }
+      ]
+    }
+  ]
+}

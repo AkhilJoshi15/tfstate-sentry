@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -race ./...
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          commit="${GITHUB_SHA::12}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X github.com/AkhilJoshi15/tfstate-sentry/internal/buildinfo.Version=${version} -X github.com/AkhilJoshi15/tfstate-sentry/internal/buildinfo.Commit=${commit} -X github.com/AkhilJoshi15/tfstate-sentry/internal/buildinfo.Date=${build_date}"
+
+          mkdir -p dist
+          targets=(
+            "linux amd64"
+            "linux arm64"
+            "darwin amd64"
+            "darwin arm64"
+            "windows amd64"
+          )
+
+          for target in "${targets[@]}"; do
+            read -r os arch <<<"${target}"
+            name="tfstate-sentry_${version}_${os}_${arch}"
+            stage="dist/${name}"
+            mkdir -p "${stage}"
+
+            binary="tfstate-sentry"
+            if [[ "${os}" == "windows" ]]; then
+              binary="tfstate-sentry.exe"
+            fi
+
+            CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" \
+              go build -trimpath -ldflags="${ldflags}" -o "${stage}/${binary}" ./cmd/tfstate-sentry
+            cp README.md LICENSE "${stage}/"
+
+            if [[ "${os}" == "windows" ]]; then
+              (cd dist && zip -qr "${name}.zip" "${name}")
+            else
+              (cd dist && tar -czf "${name}.tar.gz" "${name}")
+            fi
+            rm -rf "${stage}"
+          done
+
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: dist/*
