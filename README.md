@@ -2,6 +2,10 @@
 
 A Terraform-native analyzer that detects confidential values being persisted into state or plan data and recommends safer alternatives without printing the values.
 
+```bash
+tfstate-sentry plan --fail-on high -- -var-file=prod.tfvars
+```
+
 > Early development release. Use synthetic or approved test data only.
 
 ## Why
@@ -21,11 +25,11 @@ Terraform can mark values as sensitive to hide them in normal terminal output wh
 - known credential structures and high-risk resources
 - terminal, JSON, and SARIF 2.1.0 output
 - deterministic fingerprints that never include secret values
-- no telemetry or network requests
+- tfstate-sentry sends no telemetry and makes no direct network requests. Terraform itself may contact configured backends, providers, and cloud APIs.
 
 ## Install
 
-Download a release archive and verify it with the published SHA-256 checksums, or install from source after the first tagged release:
+Install from source after the first tagged release or build locally from the repository:
 
 ```bash
 go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@latest
@@ -33,7 +37,7 @@ go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@latest
 
 ## Build
 
-Requires Go 1.23 or newer.
+Requires Go 1.25 or newer. CI and releases use Go 1.26.x.
 
 ```bash
 make build
@@ -59,6 +63,8 @@ rm -f tfplan tfplan.json provider-schema.json
 
 Never commit plan, state, or generated JSON files. Terraform plan and state JSON can contain secrets in plaintext.
 
+tfstate-sentry detects exposure. It does not encrypt, redact, or modify Terraform state.
+
 Scan from stdin to avoid writing plan JSON to disk:
 
 ```bash
@@ -73,6 +79,8 @@ All fixtures are synthetic and invalid:
 ```bash
 make scan-demo
 ```
+
+Approved binary plans can still contain secrets. Terraform explicitly states that saved plans include full values, including sensitive data in cleartext.
 
 Example output:
 
