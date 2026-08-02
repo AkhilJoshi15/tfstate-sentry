@@ -1,0 +1,32 @@
+{
+  "format_version": "1.0",
+  "provider_schemas": {
+    "registry.terraform.io/hashicorp/aws": {
+      "resource_schemas": {
+        "aws_db_instance": {
+          "version": 2,
+          "block": {
+            "attributes": {
+              "identifier": {"type": "string", "optional": true},
+              "username": {"type": "string", "optional": true},
+              "password": {"type": "string", "optional": true, "sensitive": true},
+              "password_wo": {"type": "string", "optional": true, "sensitive": true, "write_only": true},
+              "password_wo_version": {"type": "number", "optional": true}
+            },
+            "block_types": {
+              "timeouts": {
+                "nesting_mode": "single",
+                "block": {
+                  "attributes": {
+                    "create": {"type": "string", "optional": true}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "data_source_schemas": {}
+    }
+  }
+}
