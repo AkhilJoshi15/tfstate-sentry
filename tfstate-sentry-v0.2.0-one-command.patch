@@ -1,0 +1,851 @@
+diff --git a/.gitignore b/.gitignore
+index 2f8ff61..51a925f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,6 @@ coverage.out
+ .DS_Store
+ .idea/
+ .vscode/
++
++/.tfstate-sentry/
++/tfplan
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7e9b0f7..ad1de54 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,14 @@ The project follows [Semantic Versioning](https://semver.org/).
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Add `tfstate-sentry plan` to run Terraform planning, provider-schema extraction, detailed plan conversion, and scanning through one command.
++- Stream Terraform JSON output directly into memory instead of requiring temporary JSON files.
++- Delete rejected plans automatically and support audit-only `--discard-plan` mode.
++- Protect approved plans with restrictive file permissions and a gitignored default location.
++
++
+ ## [0.1.0] - 2026-08-02
+ 
+ ### Added
+diff --git a/Makefile b/Makefile
+index 9ce89cf..41ce73d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ .PHONY: build test test-race fmt fmt-check vet scan-demo clean
+ 
+ BINARY := bin/tfstate-sentry
+-VERSION ?= 0.1.0-dev
++VERSION ?= 0.2.0-dev
+ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+ BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+ LDFLAGS := -s -w \
+diff --git a/README.md b/README.md
+index 364f3f9..77ad194 100644
+--- a/README.md
++++ b/README.md
+@@ -12,6 +12,7 @@ Terraform can mark values as sensitive to hide them in normal terminal output wh
+ 
+ ## Current capabilities
+ 
++- one-command Terraform plan and scan workflow
+ - raw `terraform.tfstate` JSON
+ - `terraform show -json` state output
+ - `terraform show -json` plan output
+@@ -22,6 +23,7 @@ Terraform can mark values as sensitive to hide them in normal terminal output wh
+ - terminal, JSON, and SARIF 2.1.0 output
+ - deterministic fingerprints that never include secret values
+ - no telemetry or network requests
++- no temporary plan JSON or provider-schema JSON files
+ 
+ ## Install
+ 
+@@ -40,26 +42,50 @@ make build
+ ./bin/tfstate-sentry version
+ ```
+ 
+-## Safe usage
++## One-command plan gate
+ 
+-Create a saved plan and provider schema inside the same trusted CI runner:
++Run Terraform planning and the security scan through one command:
+ 
+ ```bash
+-terraform plan -out=tfplan
+-terraform show -json tfplan > tfplan.json
+-terraform providers schema -json > provider-schema.json
++./tfstate-sentry plan --fail-on high -- -var-file=prod.tfvars
++```
+ 
+-./tfstate-sentry scan \
+-  --schema provider-schema.json \
++Internally, `tfstate-sentry`:
++
++1. runs `terraform plan`
++2. reads `terraform providers schema -json` directly into memory
++3. reads `terraform show -json` directly into memory
++4. scans the detailed plan
++5. deletes rejected plans automatically
++
++No plan JSON or provider-schema JSON files are written to disk. Approved binary plans are stored at `.tfstate-sentry/tfplan` with restrictive permissions so the exact scanned plan can be applied:
++
++```bash
++terraform apply .tfstate-sentry/tfplan
++```
++
++Use Terraform plan flags after `--`:
++
++```bash
++./tfstate-sentry plan \
++  --out=tfplan \
+   --fail-on high \
+-  tfplan.json
++  -- \
++  -input=false \
++  -var-file=prod.tfvars
++```
++
++For audit-only runs that should leave no plan behind:
+ 
+-rm -f tfplan tfplan.json provider-schema.json
++```bash
++./tfstate-sentry plan --discard-plan --fail-on high
+ ```
+ 
+-Never commit plan, state, or generated JSON files. Terraform plan and state JSON can contain secrets in plaintext.
++Never commit saved plans, state, or generated reports. Saved plan files can contain secrets in plaintext.
++
++## Advanced scan mode
+ 
+-Scan from stdin to avoid writing plan JSON to disk:
++The lower-level `scan` command remains available for existing JSON artifacts and pipelines:
+ 
+ ```bash
+ terraform show -json tfplan | \
+@@ -120,6 +146,7 @@ See [the threat model](docs/threat-model.md), [clean-room rules](docs/clean-room
+ 
+ ## Roadmap
+ 
++- optional plan-and-apply workflow with explicit approval controls
+ - baseline mode to block only newly introduced exposure
+ - richer provider-version-aware remediation catalog
+ - source mapping from Terraform configuration to findings
+diff --git a/docs/threat-model.md b/docs/threat-model.md
+index ee18dcd..822b066 100644
+--- a/docs/threat-model.md
++++ b/docs/threat-model.md
+@@ -17,9 +17,11 @@
+ ## Security boundaries
+ 
+ - Input is untrusted JSON and is capped at 100 MiB.
+-- The scanner performs no network requests.
++- The scanner performs no network requests. The `plan` wrapper executes the locally installed Terraform CLI, which may contact configured backends and providers as Terraform normally does.
+ - Findings contain resource address, attribute path, evidence category, remediation, and a fingerprint derived only from metadata.
+-- Output files are created with mode `0600`.
++- Output files and approved saved plans are created with restrictive permissions where the operating system supports them.
++- Detailed plan JSON and provider schema JSON are held in process memory and are not written as temporary files.
++- Rejected saved plans are deleted by default.
+ - Secret values are never used in fingerprints.
+ 
+ ## Non-goals for v0.1
+diff --git a/internal/app/app.go b/internal/app/app.go
+index 79cdda8..acae02d 100644
+--- a/internal/app/app.go
++++ b/internal/app/app.go
+@@ -1,11 +1,13 @@
+ package app
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/AkhilJoshi15/tfstate-sentry/internal/buildinfo"
+@@ -14,16 +16,31 @@ import (
+ 	"github.com/AkhilJoshi15/tfstate-sentry/internal/parser"
+ 	"github.com/AkhilJoshi15/tfstate-sentry/internal/report"
+ 	providerschema "github.com/AkhilJoshi15/tfstate-sentry/internal/schema"
++	"github.com/AkhilJoshi15/tfstate-sentry/internal/terraformcli"
+ )
+ 
+-type options struct {
+-	input  string
+-	schema string
++type reportOptions struct {
+ 	format string
+ 	output string
+ 	failOn string
+ }
+ 
++type scanOptions struct {
++	input  string
++	schema string
++	reportOptions
++}
++
++type planOptions struct {
++	planOutput     string
++	chdir          string
++	terraformBin   string
++	keepFailedPlan bool
++	discardPlan    bool
++	overwrite      bool
++	reportOptions
++}
++
+ func Run(args []string, stdout, stderr io.Writer) int {
+ 	if len(args) == 0 {
+ 		usage(stderr)
+@@ -36,6 +53,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
+ 		return 0
+ 	case "scan":
+ 		return runScan(args[1:], stdout, stderr)
++	case "plan":
++		return runPlan(args[1:], stdout, stderr)
+ 	case "help", "--help", "-h":
+ 		usage(stdout)
+ 		return 0
+@@ -49,11 +68,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
+ func runScan(args []string, stdout, stderr io.Writer) int {
+ 	set := flag.NewFlagSet("scan", flag.ContinueOnError)
+ 	set.SetOutput(stderr)
+-	var opts options
++	var opts scanOptions
+ 	set.StringVar(&opts.schema, "schema", "", "path to terraform providers schema -json output")
+-	set.StringVar(&opts.format, "format", "text", "output format: text, json, or sarif")
+-	set.StringVar(&opts.output, "output", "", "write report to a file instead of stdout")
+-	set.StringVar(&opts.failOn, "fail-on", "high", "exit 3 when findings meet threshold: none, low, medium, high, critical")
++	addReportFlags(set, &opts.reportOptions)
+ 	set.Usage = func() { scanUsage(stderr) }
+ 	if err := set.Parse(args); err != nil {
+ 		return 2
+@@ -64,14 +81,9 @@ func runScan(args []string, stdout, stderr io.Writer) int {
+ 	}
+ 	opts.input = set.Arg(0)
+ 
+-	if !validFormat(opts.format) {
+-		fmt.Fprintf(stderr, "invalid --format %q\n", opts.format)
+-		return 2
+-	}
+-	threshold, err := parseThreshold(opts.failOn)
+-	if err != nil {
+-		fmt.Fprintln(stderr, err)
+-		return 2
++	threshold, code := validateReportOptions(opts.reportOptions, stderr)
++	if code != 0 {
++		return code
+ 	}
+ 
+ 	resources, err := parser.Load(opts.input)
+@@ -87,30 +99,172 @@ func runScan(args []string, stdout, stderr io.Writer) int {
+ 	}
+ 
+ 	findings := detector.Scanner{Schema: schemaIndex}.Scan(resources)
++	if err := writeReport(opts.reportOptions, opts.input, findings, stdout); err != nil {
++		fmt.Fprintf(stderr, "write report: %v\n", err)
++		return 1
++	}
+ 
+-	writer := stdout
+-	var file *os.File
+-	if opts.output != "" {
+-		file, err = os.OpenFile(opts.output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+-		if err != nil {
+-			fmt.Fprintf(stderr, "create report: %v\n", err)
++	if meetsThreshold(findings, threshold) {
++		return 3
++	}
++	return 0
++}
++
++func runPlan(args []string, stdout, stderr io.Writer) int {
++	set := flag.NewFlagSet("plan", flag.ContinueOnError)
++	set.SetOutput(stderr)
++	var opts planOptions
++	set.StringVar(&opts.planOutput, "out", filepath.Join(".tfstate-sentry", "tfplan"), "saved Terraform plan path")
++	set.StringVar(&opts.chdir, "chdir", ".", "Terraform root module directory")
++	set.StringVar(&opts.terraformBin, "terraform-bin", "terraform", "Terraform executable path")
++	set.BoolVar(&opts.keepFailedPlan, "keep-failed-plan", false, "keep the saved plan when the security gate fails")
++	set.BoolVar(&opts.discardPlan, "discard-plan", false, "delete an approved plan after scanning (audit-only mode)")
++	set.BoolVar(&opts.overwrite, "overwrite", false, "replace an existing saved plan")
++	addReportFlags(set, &opts.reportOptions)
++	set.Usage = func() { planUsage(stderr) }
++	if err := set.Parse(args); err != nil {
++		return 2
++	}
++
++	threshold, code := validateReportOptions(opts.reportOptions, stderr)
++	if code != 0 {
++		return code
++	}
++	if strings.TrimSpace(opts.planOutput) == "" {
++		fmt.Fprintln(stderr, "--out cannot be empty")
++		return 2
++	}
++
++	localPlanPath := terraformcli.AbsolutePlanPath(opts.chdir, opts.planOutput)
++	if !opts.overwrite {
++		if _, err := os.Stat(localPlanPath); err == nil {
++			fmt.Fprintf(stderr, "saved plan already exists: %s; use --overwrite to replace it\n", localPlanPath)
++			return 1
++		} else if !errors.Is(err, os.ErrNotExist) {
++			fmt.Fprintf(stderr, "inspect saved plan path: %v\n", err)
+ 			return 1
+ 		}
+-		defer file.Close()
+-		writer = file
+ 	}
+ 
+-	if err := report.Write(opts.format, writer, opts.input, findings); err != nil {
++	if err := os.MkdirAll(filepath.Dir(localPlanPath), 0o700); err != nil {
++		fmt.Fprintf(stderr, "create saved plan directory: %v\n", err)
++		return 1
++	}
++
++	client := terraformcli.Client{
++		Binary: opts.terraformBin,
++		Dir:    opts.chdir,
++		Stdin:  os.Stdin,
++		Stdout: stdout,
++		Stderr: stderr,
++	}
++
++	ctx := context.Background()
++	planArgs := set.Args()
++	if err := client.Plan(ctx, opts.planOutput, planArgs); err != nil {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintln(stderr, err)
++		return 1
++	}
++	if err := os.Chmod(localPlanPath, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintf(stderr, "secure saved plan permissions: %v\n", err)
++		return 1
++	}
++
++	schemaJSON, err := client.ProviderSchema(ctx, planArgs)
++	if err != nil {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintln(stderr, err)
++		return 1
++	}
++	planJSON, err := client.ShowPlan(ctx, opts.planOutput)
++	if err != nil {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintln(stderr, err)
++		return 1
++	}
++
++	schemaIndex, err := providerschema.Parse(schemaJSON)
++	if err != nil {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintf(stderr, "scan failed: %v\n", err)
++		return 1
++	}
++	resources, err := parser.Parse(planJSON)
++	if err != nil {
++		_ = os.Remove(localPlanPath)
++		fmt.Fprintf(stderr, "scan failed: %v\n", err)
++		return 1
++	}
++
++	findings := detector.Scanner{Schema: schemaIndex}.Scan(resources)
++	if err := writeReport(opts.reportOptions, opts.planOutput, findings, stdout); err != nil {
++		_ = os.Remove(localPlanPath)
+ 		fmt.Fprintf(stderr, "write report: %v\n", err)
+ 		return 1
+ 	}
+ 
+ 	if meetsThreshold(findings, threshold) {
++		if opts.keepFailedPlan {
++			fmt.Fprintf(stderr, "security gate failed; saved plan retained at %s\n", localPlanPath)
++		} else {
++			if err := os.Remove(localPlanPath); err != nil && !errors.Is(err, os.ErrNotExist) {
++				fmt.Fprintf(stderr, "security gate failed; remove rejected plan manually: %v\n", err)
++			} else {
++				fmt.Fprintf(stderr, "security gate failed; rejected plan removed: %s\n", localPlanPath)
++			}
++		}
+ 		return 3
+ 	}
++
++	if opts.discardPlan {
++		if err := os.Remove(localPlanPath); err != nil && !errors.Is(err, os.ErrNotExist) {
++			fmt.Fprintf(stderr, "security gate passed; remove discarded plan manually: %v\n", err)
++			return 1
++		}
++		fmt.Fprintln(stderr, "security gate passed; approved plan discarded")
++		return 0
++	}
++
++	fmt.Fprintf(stderr, "security gate passed; apply the approved plan with: terraform apply %q\n", opts.planOutput)
+ 	return 0
+ }
+ 
++func addReportFlags(set *flag.FlagSet, opts *reportOptions) {
++	set.StringVar(&opts.format, "format", "text", "output format: text, json, or sarif")
++	set.StringVar(&opts.output, "output", "", "write report to a file instead of stdout")
++	set.StringVar(&opts.failOn, "fail-on", "high", "exit 3 when findings meet threshold: none, low, medium, high, critical")
++}
++
++func validateReportOptions(opts reportOptions, stderr io.Writer) (model.Severity, int) {
++	if !validFormat(opts.format) {
++		fmt.Fprintf(stderr, "invalid --format %q\n", opts.format)
++		return model.SeverityUnknown, 2
++	}
++	threshold, err := parseThreshold(opts.failOn)
++	if err != nil {
++		fmt.Fprintln(stderr, err)
++		return model.SeverityUnknown, 2
++	}
++	return threshold, 0
++}
++
++func writeReport(opts reportOptions, input string, findings []model.Finding, stdout io.Writer) error {
++	writer := stdout
++	var file *os.File
++	var err error
++	if opts.output != "" {
++		file, err = os.OpenFile(opts.output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
++		if err != nil {
++			return fmt.Errorf("create report: %w", err)
++		}
++		defer file.Close()
++		writer = file
++	}
++	return report.Write(opts.format, writer, input, findings)
++}
++
+ func parseThreshold(value string) (model.Severity, error) {
+ 	if strings.EqualFold(value, "none") {
+ 		return model.SeverityUnknown, nil
+@@ -147,10 +301,34 @@ func usage(writer io.Writer) {
+ 	fmt.Fprintln(writer, `tfstate-sentry detects confidential values persisted in Terraform plan and state data.
+ 
+ Usage:
++  tfstate-sentry plan [flags] -- [terraform plan flags]
+   tfstate-sentry scan [flags] <state-or-plan.json>
+   tfstate-sentry version
+ 
+-Run "tfstate-sentry scan -h" for scan flags.`)
++Run "tfstate-sentry plan -h" or "tfstate-sentry scan -h" for command flags.`)
++}
++
++func planUsage(writer io.Writer) {
++	fmt.Fprintln(writer, `Usage:
++  tfstate-sentry plan [flags] -- [terraform plan flags]
++
++Runs terraform plan, reads provider schema and detailed plan JSON directly from
++Terraform, scans them in memory, and leaves only the approved binary plan.
++Rejected plans are deleted by default.
++
++Example:
++  tfstate-sentry plan --out=tfplan --fail-on high -- -var-file=prod.tfvars
++
++Flags:
++  --out <path>             saved binary plan path (default: .tfstate-sentry/tfplan)
++  --chdir <path>           Terraform root module directory (default: .)
++  --terraform-bin <path>   Terraform executable (default: terraform)
++  --keep-failed-plan       retain a plan rejected by the security gate
++  --discard-plan           delete an approved plan after scanning (audit-only)
++  --overwrite              replace an existing saved plan
++  --format <format>        text, json, or sarif (default: text)
++  --output <path>          report destination; files are created with mode 0600
++  --fail-on <severity>     none, low, medium, high, critical (default: high)`)
+ }
+ 
+ func scanUsage(writer io.Writer) {
+diff --git a/internal/app/app_test.go b/internal/app/app_test.go
+index dfd9e8c..165d3ee 100644
+--- a/internal/app/app_test.go
++++ b/internal/app/app_test.go
+@@ -2,7 +2,10 @@ package app
+ 
+ import (
+ 	"bytes"
++	"errors"
++	"os"
+ 	"path/filepath"
++	"runtime"
+ 	"strings"
+ 	"testing"
+ )
+@@ -27,3 +30,126 @@ func TestRunScanRedactsAndReturnsThresholdExit(t *testing.T) {
+ 		t.Fatal("output leaked password")
+ 	}
+ }
++
++func TestRunPlanWrapsTerraformAndRemovesRejectedPlan(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("test uses a POSIX fake Terraform executable")
++	}
++
++	tempDir := t.TempDir()
++	terraformPath := filepath.Join(tempDir, "terraform")
++	writeFakeTerraform(t, terraformPath)
++
++	planFixture, err := filepath.Abs(filepath.Join("..", "..", "testdata", "show-plan", "unsafe.plan.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	schemaFixture, err := filepath.Abs(filepath.Join("..", "..", "testdata", "schema", "provider-schema.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("TFSTATE_SENTRY_PLAN_FIXTURE", planFixture)
++	t.Setenv("TFSTATE_SENTRY_SCHEMA_FIXTURE", schemaFixture)
++
++	var stdout bytes.Buffer
++	var stderr bytes.Buffer
++	code := Run([]string{
++		"plan",
++		"--terraform-bin", terraformPath,
++		"--chdir", tempDir,
++		"--out", "tfplan",
++		"--fail-on", "high",
++		"--",
++		"-var-file=synthetic.tfvars",
++	}, &stdout, &stderr)
++	if code != 3 {
++		t.Fatalf("expected exit 3, got %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
++	}
++	if _, err := os.Stat(filepath.Join(tempDir, "tfplan")); !errors.Is(err, os.ErrNotExist) {
++		t.Fatalf("rejected plan should be removed, stat error=%v", err)
++	}
++	if strings.Contains(stdout.String(), "synthetic-password-not-valid") {
++		t.Fatal("output leaked password")
++	}
++	if !strings.Contains(stderr.String(), "rejected plan removed") {
++		t.Fatalf("expected cleanup message, got %s", stderr.String())
++	}
++}
++
++func TestRunPlanKeepsApprovedPlan(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("test uses a POSIX fake Terraform executable")
++	}
++
++	tempDir := t.TempDir()
++	terraformPath := filepath.Join(tempDir, "terraform")
++	writeFakeTerraform(t, terraformPath)
++
++	planFixture, err := filepath.Abs(filepath.Join("..", "..", "testdata", "show-plan", "unsafe.plan.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	schemaFixture, err := filepath.Abs(filepath.Join("..", "..", "testdata", "schema", "provider-schema.json"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("TFSTATE_SENTRY_PLAN_FIXTURE", planFixture)
++	t.Setenv("TFSTATE_SENTRY_SCHEMA_FIXTURE", schemaFixture)
++
++	var stdout bytes.Buffer
++	var stderr bytes.Buffer
++	code := Run([]string{
++		"plan",
++		"--terraform-bin", terraformPath,
++		"--chdir", tempDir,
++		"--out", "tfplan",
++		"--fail-on", "none",
++	}, &stdout, &stderr)
++	if code != 0 {
++		t.Fatalf("expected exit 0, got %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
++	}
++	info, err := os.Stat(filepath.Join(tempDir, "tfplan"))
++	if err != nil {
++		t.Fatalf("approved plan should remain: %v", err)
++	}
++	if info.Mode().Perm() != 0o600 {
++		t.Fatalf("expected plan mode 0600, got %o", info.Mode().Perm())
++	}
++	if !strings.Contains(stderr.String(), "security gate passed") {
++		t.Fatalf("expected pass message, got %s", stderr.String())
++	}
++}
++
++func writeFakeTerraform(t *testing.T, path string) {
++	t.Helper()
++	script := `#!/bin/sh
++set -eu
++case "$1" in
++  plan)
++    shift
++    output=""
++    for arg in "$@"; do
++      case "$arg" in
++        -out=*) output="${arg#-out=}" ;;
++      esac
++    done
++    test -n "$output"
++    printf 'synthetic-binary-plan' > "$output"
++    echo 'Terraform generated a synthetic plan.'
++    ;;
++  providers)
++    cat "$TFSTATE_SENTRY_SCHEMA_FIXTURE"
++    ;;
++  show)
++    cat "$TFSTATE_SENTRY_PLAN_FIXTURE"
++    ;;
++  *)
++    echo "unexpected Terraform command: $1" >&2
++    exit 1
++    ;;
++esac
++`
++	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/internal/parser/parser.go b/internal/parser/parser.go
+index 271c294..2d56b94 100644
+--- a/internal/parser/parser.go
++++ b/internal/parser/parser.go
+@@ -25,11 +25,18 @@ func Load(path string) ([]model.Resource, error) {
+ 		defer file.Close()
+ 		reader = file
+ 	}
++	return LoadReader(reader)
++}
+ 
++func LoadReader(reader io.Reader) ([]model.Resource, error) {
+ 	data, err := io.ReadAll(io.LimitReader(reader, maxInputBytes+1))
+ 	if err != nil {
+ 		return nil, fmt.Errorf("read input: %w", err)
+ 	}
++	return Parse(data)
++}
++
++func Parse(data []byte) ([]model.Resource, error) {
+ 	if len(data) > maxInputBytes {
+ 		return nil, fmt.Errorf("input exceeds %d MiB limit", maxInputBytes>>20)
+ 	}
+diff --git a/internal/schema/schema.go b/internal/schema/schema.go
+index 35b82f6..183bfaf 100644
+--- a/internal/schema/schema.go
++++ b/internal/schema/schema.go
+@@ -31,7 +31,10 @@ func Load(path string) (*Index, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("read provider schema: %w", err)
+ 	}
++	return Parse(data)
++}
+ 
++func Parse(data []byte) (*Index, error) {
+ 	var root map[string]any
+ 	if err := json.Unmarshal(data, &root); err != nil {
+ 		return nil, fmt.Errorf("decode provider schema: %w", err)
+diff --git a/internal/terraformcli/terraformcli.go b/internal/terraformcli/terraformcli.go
+new file mode 100644
+index 0000000..d874d5c
+--- /dev/null
++++ b/internal/terraformcli/terraformcli.go
+@@ -0,0 +1,156 @@
++package terraformcli
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os/exec"
++	"path/filepath"
++	"strings"
++)
++
++const maxOutputBytes = 100 << 20 // 100 MiB
++
++// Client executes Terraform using argument arrays rather than a shell.
++type Client struct {
++	Binary string
++	Dir    string
++	Stdin  io.Reader
++	Stdout io.Writer
++	Stderr io.Writer
++}
++
++func (c Client) Plan(ctx context.Context, outputPath string, args []string) error {
++	if strings.TrimSpace(outputPath) == "" {
++		return errors.New("plan output path is required")
++	}
++	if containsOutFlag(args) {
++		return errors.New("pass the saved plan path with tfstate-sentry --out, not terraform -out")
++	}
++
++	commandArgs := []string{"plan", "-out=" + outputPath}
++	commandArgs = append(commandArgs, args...)
++	cmd := c.command(ctx, commandArgs...)
++	cmd.Stdin = c.Stdin
++	cmd.Stdout = c.Stdout
++	cmd.Stderr = c.Stderr
++
++	err := cmd.Run()
++	if err == nil {
++		return nil
++	}
++
++	var exitErr *exec.ExitError
++	if errors.As(err, &exitErr) && exitErr.ExitCode() == 2 && hasDetailedExitCode(args) {
++		return nil
++	}
++	return fmt.Errorf("terraform plan failed: %w", err)
++}
++
++func (c Client) ProviderSchema(ctx context.Context, planArgs []string) ([]byte, error) {
++	args := []string{"providers", "schema", "-json"}
++	args = append(args, variableArgs(planArgs)...)
++	return c.output(ctx, args...)
++}
++
++func (c Client) ShowPlan(ctx context.Context, planPath string) ([]byte, error) {
++	return c.output(ctx, "show", "-json", planPath)
++}
++
++func (c Client) command(ctx context.Context, args ...string) *exec.Cmd {
++	binary := c.Binary
++	if strings.TrimSpace(binary) == "" {
++		binary = "terraform"
++	}
++	cmd := exec.CommandContext(ctx, binary, args...)
++	if strings.TrimSpace(c.Dir) != "" {
++		cmd.Dir = c.Dir
++	}
++	return cmd
++}
++
++func (c Client) output(ctx context.Context, args ...string) ([]byte, error) {
++	var stdout cappedBuffer
++	stdout.limit = maxOutputBytes
++
++	cmd := c.command(ctx, args...)
++	cmd.Stdin = c.Stdin
++	cmd.Stdout = &stdout
++	cmd.Stderr = c.Stderr
++
++	if err := cmd.Run(); err != nil {
++		return nil, fmt.Errorf("terraform %s failed: %w", strings.Join(args, " "), err)
++	}
++	if stdout.exceeded {
++		return nil, fmt.Errorf("terraform %s output exceeds %d MiB limit", strings.Join(args, " "), maxOutputBytes>>20)
++	}
++	return stdout.Bytes(), nil
++}
++
++type cappedBuffer struct {
++	bytes.Buffer
++	limit    int
++	exceeded bool
++}
++
++func (b *cappedBuffer) Write(p []byte) (int, error) {
++	originalLength := len(p)
++	remaining := b.limit - b.Len()
++	if remaining <= 0 {
++		b.exceeded = true
++		return originalLength, nil
++	}
++	if len(p) > remaining {
++		_, _ = b.Buffer.Write(p[:remaining])
++		b.exceeded = true
++		return originalLength, nil
++	}
++	_, _ = b.Buffer.Write(p)
++	return originalLength, nil
++}
++
++func containsOutFlag(args []string) bool {
++	for _, arg := range args {
++		if arg == "-out" || arg == "--out" || strings.HasPrefix(arg, "-out=") || strings.HasPrefix(arg, "--out=") {
++			return true
++		}
++	}
++	return false
++}
++
++func hasDetailedExitCode(args []string) bool {
++	for _, arg := range args {
++		if arg == "-detailed-exitcode" || arg == "--detailed-exitcode" {
++			return true
++		}
++	}
++	return false
++}
++
++func variableArgs(args []string) []string {
++	var result []string
++	for index := 0; index < len(args); index++ {
++		arg := args[index]
++		switch {
++		case arg == "-var" || arg == "--var" || arg == "-var-file" || arg == "--var-file":
++			if index+1 < len(args) {
++				result = append(result, arg, args[index+1])
++				index++
++			}
++		case strings.HasPrefix(arg, "-var=") || strings.HasPrefix(arg, "--var=") ||
++			strings.HasPrefix(arg, "-var-file=") || strings.HasPrefix(arg, "--var-file="):
++			result = append(result, arg)
++		}
++	}
++	return result
++}
++
++// AbsolutePlanPath resolves a relative plan path against the Terraform working directory.
++func AbsolutePlanPath(dir, planPath string) string {
++	if planPath == "" || filepath.IsAbs(planPath) || strings.TrimSpace(dir) == "" {
++		return planPath
++	}
++	return filepath.Join(dir, planPath)
++}
+diff --git a/internal/terraformcli/terraformcli_test.go b/internal/terraformcli/terraformcli_test.go
+new file mode 100644
+index 0000000..3495afe
+--- /dev/null
++++ b/internal/terraformcli/terraformcli_test.go
+@@ -0,0 +1,40 @@
++package terraformcli
++
++import (
++	"path/filepath"
++	"reflect"
++	"testing"
++)
++
++func TestVariableArgs(t *testing.T) {
++	input := []string{
++		"-var-file=prod.tfvars",
++		"-target=aws_db_instance.main",
++		"-var", "region=us-east-1",
++		"--var-file", "shared.tfvars",
++	}
++	want := []string{
++		"-var-file=prod.tfvars",
++		"-var", "region=us-east-1",
++		"--var-file", "shared.tfvars",
++	}
++	if got := variableArgs(input); !reflect.DeepEqual(got, want) {
++		t.Fatalf("variableArgs()=%v, want %v", got, want)
++	}
++}
++
++func TestAbsolutePlanPath(t *testing.T) {
++	got := AbsolutePlanPath(filepath.Join("tmp", "infra"), "tfplan")
++	want := filepath.Join("tmp", "infra", "tfplan")
++	if got != want {
++		t.Fatalf("AbsolutePlanPath()=%q, want %q", got, want)
++	}
++}
++
++func TestContainsOutFlag(t *testing.T) {
++	for _, args := range [][]string{{"-out=tfplan"}, {"-out", "tfplan"}, {"--out=tfplan"}} {
++		if !containsOutFlag(args) {
++			t.Fatalf("expected output flag to be detected in %v", args)
++		}
++	}
++}
