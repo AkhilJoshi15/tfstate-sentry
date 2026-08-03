@@ -5,6 +5,7 @@
 *.tfstate.*
 !testdata/**/*.tfstate.json
 *.sarif
+coverage
 coverage.out
 .DS_Store
 .idea/
