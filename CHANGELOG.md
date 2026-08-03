@@ -6,6 +6,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added a one-command plan workflow that runs Terraform, scans the saved plan, and writes a verification manifest containing plan metadata and integrity information.
+- Added Terraform-backed integration tests covering unsafe and safe plan flows.
+- Expanded scanner documentation with a stronger README narrative around plan gating, CI usage, and limitations.
+
+### Changed
+
+- Strengthened the scanner’s handling of Terraform plan and state surfaces, including variables, outputs, prior state, and sensitivity-aware traversal.
+- Improved provider schema handling for data-source schemas and nested attributes.
+- Tightened the detector so generic high-risk resource findings require actual persisted-secret evidence.
+
 ## [0.1.0] - 2026-08-02
 
 ### Added
