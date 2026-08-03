@@ -6,7 +6,7 @@ A Terraform-native analyzer that detects confidential values being persisted int
 tfstate-sentry plan --fail-on high -- -var-file=prod.tfvars
 ```
 
-> Early development release. Use synthetic or approved test data only.
+> Version 0.2.0 remains an early release. Use synthetic or explicitly approved test data only.
 
 ## Why
 
@@ -39,16 +39,19 @@ The command does the following:
 
 1. Runs `terraform plan`
 2. Retrieves the provider schema
-3. Converts the saved plan to JSON in memory
+3. Converts the saved plan to temporary, permission-restricted JSON
 4. Scans for persisted confidential values
-5. Deletes rejected plans
-6. Retains approved plans for `terraform apply`
+5. Deletes temporary plan JSON and provider-schema output after every scan
+6. Deletes rejected plans and retains approved plans for `terraform apply`
+7. Writes `.tfstate-sentry/manifest.json` with the plan hash, tool versions, scan threshold, timestamp, and finding counts
 
 After a successful scan, apply the retained plan with:
 
 ```bash
 terraform apply .tfstate-sentry/tfplan
 ```
+
+Before applying, verify that the retained plan still matches the manifest's `plan_sha256`. The manifest contains metadata only; it does not contain detected values. Treat both files as sensitive artifacts because the manifest exposes local path and workflow metadata, while the binary plan can contain plaintext secrets.
 
 For audit-only behavior that discards the plan after scanning, use:
 
@@ -61,7 +64,7 @@ tfstate-sentry plan --discard-plan --fail-on high
 Download a prebuilt binary from GitHub Releases, or install with Go:
 
 ```bash
-go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@v0.1.0
+go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@v0.2.0
 ```
 
 ## Build
@@ -148,8 +151,6 @@ All fixtures are synthetic and invalid:
 make scan-demo
 ```
 
-Approved binary plans can still contain secrets. Terraform explicitly states that saved plans include full values, including sensitive data in cleartext.
-
 Example output:
 
 ```text
@@ -189,6 +190,7 @@ The SARIF output can be uploaded to GitHub code scanning with `github/codeql-act
 make fmt
 make vet
 make test
+make check-version
 make build
 ```
 
@@ -196,7 +198,7 @@ See [the threat model](docs/threat-model.md), [clean-room rules](docs/clean-room
 
 ## Releases
 
-The initial v0.1.0 release is available from GitHub Releases. Future semantic-version tags automatically run tests, cross-compile binaries, generate checksums, and publish a release.
+Version 0.2.0 adds the one-command plan gate, broader Terraform plan/state analysis, safer artifact cleanup, consolidated findings, and stronger test and release automation. Semantic-version tags run race tests, cross-compile binaries, generate checksums and an SBOM, sign release artifacts with Sigstore, and publish a GitHub Release.
 
 ## License
 

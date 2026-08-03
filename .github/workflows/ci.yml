@@ -25,10 +25,20 @@ jobs:
           cache: true
       - name: Format check
         run: make fmt-check
+      - name: Version consistency
+        run: make check-version
       - name: Vet
         run: make vet
       - name: Test
         run: make test-race
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
+          awk -v total="$total" 'BEGIN { if (total + 0 < 70) exit 1 }'
+      - name: Scanner benchmark smoke test
+        run: go test -run '^$' -bench BenchmarkScanLargePlan -benchtime=1x ./internal/detector
       - name: Build
         run: make build
       - name: Synthetic scan smoke test

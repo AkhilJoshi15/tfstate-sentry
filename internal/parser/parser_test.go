@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -68,5 +69,70 @@ func TestParseShowPlanIncludesInputsOutputsAndPriorState(t *testing.T) {
 		if !addresses[want] {
 			t.Fatalf("expected parsed address %q", want)
 		}
+	}
+}
+
+func TestLoadShowStateWithChildModule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data := `{
+		"values": {
+			"root_module": {
+				"resources": [{
+					"address": "aws_db_instance.main",
+					"type": "aws_db_instance",
+					"provider_name": "registry.terraform.io/hashicorp/aws",
+					"values": {"password": "synthetic"},
+					"sensitive_values": {"password": true}
+				}],
+				"child_modules": [{
+					"resources": [{
+						"address": "module.cache.aws_elasticache_cluster.main",
+						"type": "aws_elasticache_cluster",
+						"values": {"auth_token": "synthetic"},
+						"sensitive_values": {"auth_token": true}
+					}]
+				}]
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	resources, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 2 {
+		t.Fatalf("expected 2 resources, got %d", len(resources))
+	}
+	if resources[1].Address != "module.cache.aws_elasticache_cluster.main" {
+		t.Fatalf("unexpected child address: %s", resources[1].Address)
+	}
+	if resources[1].SourceKind != "state" {
+		t.Fatalf("expected state source, got %q", resources[1].SourceKind)
+	}
+}
+
+func TestBuildAddressHandlesKeysAndMultipleInstances(t *testing.T) {
+	tests := []struct {
+		name     string
+		instance map[string]any
+		index    int
+		count    int
+		want     string
+	}{
+		{name: "string key", instance: map[string]any{"index_key": "primary"}, count: 1, want: `module.db.aws_db_instance.main["primary"]`},
+		{name: "numeric key", instance: map[string]any{"index_key": 2}, count: 1, want: "module.db.aws_db_instance.main[2]"},
+		{name: "count index", instance: map[string]any{}, index: 1, count: 2, want: "module.db.aws_db_instance.main[1]"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := buildAddress("module.db", "aws_db_instance", "main", test.instance, test.index, test.count)
+			if got != test.want {
+				t.Fatalf("expected %q, got %q", test.want, got)
+			}
+		})
 	}
 }

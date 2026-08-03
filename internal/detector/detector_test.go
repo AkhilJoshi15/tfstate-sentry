@@ -2,6 +2,7 @@ package detector
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,8 +22,8 @@ func TestScanDetectsExposureWithoutLeakingValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	findings := (Scanner{Schema: index}).Scan(resources)
-	if len(findings) < 3 {
-		t.Fatalf("expected at least 3 findings, got %d", len(findings))
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 consolidated findings, got %d", len(findings))
 	}
 
 	encoded, err := json.Marshal(findings)
@@ -44,6 +45,38 @@ func TestScanDetectsExposureWithoutLeakingValues(t *testing.T) {
 	}
 	if !foundWriteOnly {
 		t.Fatal("expected password_wo remediation")
+	}
+}
+
+func TestConsolidatePrefersStrongestSignalAtSamePath(t *testing.T) {
+	resource := model.Resource{
+		Address:         "example.test",
+		Type:            "example",
+		Values:          map[string]any{"password": "ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
+		SensitiveValues: map[string]any{"password": true},
+	}
+	findings := (Scanner{Schema: providerschema.Empty()}).Scan([]model.Resource{resource})
+	if len(findings) != 1 {
+		t.Fatalf("expected one consolidated finding, got %d", len(findings))
+	}
+	if findings[0].RuleID != "credential.github-token" {
+		t.Fatalf("expected credential signature to win, got %s", findings[0].RuleID)
+	}
+}
+
+func BenchmarkScanLargePlan(b *testing.B) {
+	resources := make([]model.Resource, 1000)
+	for i := range resources {
+		resources[i] = model.Resource{
+			Address: fmt.Sprintf("terraform_data.example[%d]", i),
+			Type:    "terraform_data",
+			Values:  map[string]any{"input": map[string]any{"name": "ordinary-value", "enabled": true}},
+		}
+	}
+	scanner := Scanner{Schema: providerschema.Empty()}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		scanner.Scan(resources)
 	}
 }
 
