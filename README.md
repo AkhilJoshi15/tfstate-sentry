@@ -43,12 +43,15 @@ The command does the following:
 4. Scans for persisted confidential values
 5. Deletes temporary plan JSON and provider-schema output after every scan
 6. Deletes rejected plans and retains approved plans for `terraform apply`
+7. Writes `.tfstate-sentry/manifest.json` with the plan hash, tool versions, scan threshold, timestamp, and finding counts
 
 After a successful scan, apply the retained plan with:
 
 ```bash
 terraform apply .tfstate-sentry/tfplan
 ```
+
+Before applying, verify that the retained plan still matches the manifest's `plan_sha256`. The manifest contains metadata only; it does not contain detected values. Treat both files as sensitive artifacts because the manifest exposes local path and workflow metadata, while the binary plan can contain plaintext secrets.
 
 For audit-only behavior that discards the plan after scanning, use:
 
@@ -147,8 +150,6 @@ All fixtures are synthetic and invalid:
 ```bash
 make scan-demo
 ```
-
-Approved binary plans can still contain secrets. Terraform explicitly states that saved plans include full values, including sensitive data in cleartext.
 
 Example output:
 
