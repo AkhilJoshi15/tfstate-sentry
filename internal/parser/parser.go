@@ -57,31 +57,93 @@ func Load(path string) ([]model.Resource, error) {
 }
 
 func parseShowPlan(root map[string]any) []model.Resource {
-	// resource_changes contains after_sensitive and catches planned exposures most directly.
+	var resources []model.Resource
+
 	if changes, ok := root["resource_changes"].([]any); ok {
-		resources := make([]model.Resource, 0, len(changes))
+		resources = make([]model.Resource, 0, len(changes)+4)
 		for _, item := range changes {
 			changeResource, _ := item.(map[string]any)
 			change, _ := changeResource["change"].(map[string]any)
-			after := change["after"]
-			if after == nil {
+			address := stringValue(changeResource["address"])
+			resourceType := stringValue(changeResource["type"])
+			providerName := stringValue(changeResource["provider_name"])
+
+			var values any
+			var sensitive any
+			if before := change["before"]; before != nil {
+				values = before
+			}
+			if after := change["after"]; after != nil {
+				values = after
+			}
+			if afterSensitive := change["after_sensitive"]; afterSensitive != nil {
+				sensitive = afterSensitive
+			} else if beforeSensitive := change["before_sensitive"]; beforeSensitive != nil {
+				sensitive = beforeSensitive
+			}
+
+			if values == nil && sensitive == nil {
 				continue
 			}
+
 			resources = append(resources, model.Resource{
-				Address:         stringValue(changeResource["address"]),
-				Type:            stringValue(changeResource["type"]),
-				ProviderName:    stringValue(changeResource["provider_name"]),
-				Values:          after,
-				SensitiveValues: change["after_sensitive"],
+				Address:         address,
+				Type:            resourceType,
+				ProviderName:    providerName,
+				Values:          values,
+				SensitiveValues: sensitive,
 				SourceKind:      "plan",
 			})
 		}
-		return resources
 	}
 
-	plannedValues, _ := root["planned_values"].(map[string]any)
-	rootModule, _ := plannedValues["root_module"].(map[string]any)
-	return parseModule(rootModule, "plan")
+	if variables, ok := root["variables"].(map[string]any); ok {
+		for name, variable := range variables {
+			entry, _ := variable.(map[string]any)
+			value, _ := entry["value"]
+			if value == nil {
+				continue
+			}
+			resources = append(resources, model.Resource{
+				Address:         "var." + name,
+				Type:            "variable",
+				Values:          value,
+				SensitiveValues: map[string]any{"value": boolValue(entry["sensitive"])},
+				SourceKind:      "plan",
+			})
+		}
+	}
+
+	if outputs, ok := root["output_changes"].(map[string]any); ok {
+		for name, output := range outputs {
+			entry, _ := output.(map[string]any)
+			if value, ok := entry["after"]; ok && value != nil {
+				resources = append(resources, model.Resource{
+					Address:         "output." + name,
+					Type:            "output",
+					Values:          value,
+					SensitiveValues: entry["after_sensitive"],
+					SourceKind:      "plan",
+				})
+			}
+		}
+	}
+
+	if plannedValues, ok := root["planned_values"].(map[string]any); ok {
+		if rootModule, ok := plannedValues["root_module"].(map[string]any); ok {
+			resources = append(resources, parseModule(rootModule, "plan")...)
+		}
+	}
+
+	if priorState, ok := root["prior_state"].(map[string]any); ok {
+		if values, ok := priorState["values"].(map[string]any); ok {
+			if rootModule, ok := values["root_module"].(map[string]any); ok {
+				resources = append(resources, parseModule(rootModule, "state")...)
+			}
+		}
+	}
+
+	return resources
 }
 
 func parseShowState(root map[string]any) []model.Resource {
@@ -189,5 +251,10 @@ func hasArray(root map[string]any, key string) bool {
 
 func stringValue(value any) string {
 	result, _ := value.(string)
+	return result
+}
+
+func boolValue(value any) bool {
+	result, _ := value.(bool)
 	return result
 }

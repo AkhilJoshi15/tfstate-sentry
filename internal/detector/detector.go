@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/AkhilJoshi15/tfstate-sentry/internal/model"
@@ -50,7 +51,7 @@ func (s Scanner) Scan(resources []model.Resource) []model.Finding {
 	var findings []model.Finding
 
 	for _, resource := range resources {
-		if reason, ok := highRiskResources[resource.Type]; ok {
+		if reason, ok := highRiskResources[resource.Type]; ok && resourceHasPersistedSecret(resource) {
 			finding := s.finding("resource.high-risk", model.SeverityHigh, resource, "$", "Secret-producing resource detected.", reason, "Prefer an ephemeral resource, a write-only argument, or create only the secret container and let the workload populate/retrieve the value at runtime.")
 			appendUnique(&findings, seen, finding)
 		}
@@ -173,7 +174,24 @@ func isSensitivePath(tree any, path string) bool {
 		return false
 	}
 	cursor := tree
-	for _, part := range strings.Split(normalizePath(path), ".") {
+	parts := strings.Split(path, ".")
+	for _, part := range parts {
+		if part == "" || part == "<json>" {
+			continue
+		}
+		if strings.HasPrefix(part, "[") {
+			indexValue := strings.Trim(part, "[]")
+			list, ok := cursor.([]any)
+			if !ok {
+				return false
+			}
+			parsed, err := strconv.Atoi(indexValue)
+			if err != nil || parsed < 0 || parsed >= len(list) {
+				return false
+			}
+			cursor = list[parsed]
+			continue
+		}
 		object, ok := cursor.(map[string]any)
 		if !ok {
 			return false
@@ -185,6 +203,40 @@ func isSensitivePath(tree any, path string) bool {
 	}
 	flag, _ := cursor.(bool)
 	return flag
+}
+
+func resourceHasPersistedSecret(resource model.Resource) bool {
+	if resource.Values == nil && resource.SensitiveValues == nil {
+		return false
+	}
+	matched := false
+	walk(resource.Values, "", func(path string, value any) {
+		if matched {
+			return
+		}
+		if value == nil {
+			return
+		}
+		if isSensitivePath(resource.SensitiveValues, path) {
+			matched = true
+			return
+		}
+		if _, ok := resource.Values.(map[string]any); ok {
+			if secretNamePattern.MatchString("_"+leafName(path)+"_") && isNonEmptyScalar(value) {
+				matched = true
+				return
+			}
+			if text, ok := value.(string); ok && text != "" {
+				for _, pattern := range credentialPatterns {
+					if pattern.pattern.MatchString(text) {
+						matched = true
+						return
+					}
+				}
+			}
+		}
+	})
+	return matched
 }
 
 func normalizePath(path string) string {
