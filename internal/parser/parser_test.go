@@ -44,10 +44,10 @@ func TestParseShowPlanIncludesInputsOutputsAndPriorState(t *testing.T) {
 			"values": map[string]any{
 				"root_module": map[string]any{
 					"resources": []any{map[string]any{
-						"address":         "module.demo.aws_db_instance.main",
-						"type":            "aws_db_instance",
-						"provider_name":   "registry.terraform.io/hashicorp/aws",
-						"values":          map[string]any{"password": "old"},
+						"address":          "module.demo.aws_db_instance.main",
+						"type":             "aws_db_instance",
+						"provider_name":    "registry.terraform.io/hashicorp/aws",
+						"values":           map[string]any{"password": "old"},
 						"sensitive_values": map[string]any{"password": true},
 					}},
 				},
