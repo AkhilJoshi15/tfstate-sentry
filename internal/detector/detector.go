@@ -118,7 +118,51 @@ func (s Scanner) Scan(resources []model.Resource) []model.Finding {
 		return findings[i].RuleID < findings[j].RuleID
 	})
 
-	return findings
+	return consolidate(findings)
+}
+
+// consolidate keeps the strongest finding for a resource path. Multiple
+// detectors often corroborate the same exposure; reporting each signal as a
+// separate finding creates alert fatigue without identifying another secret.
+func consolidate(findings []model.Finding) []model.Finding {
+	byLocation := make(map[string]model.Finding, len(findings))
+	order := make([]string, 0, len(findings))
+	for _, finding := range findings {
+		key := finding.Resource + "|" + finding.Path
+		current, ok := byLocation[key]
+		if !ok {
+			byLocation[key] = finding
+			order = append(order, key)
+			continue
+		}
+		if findingPriority(finding) > findingPriority(current) {
+			byLocation[key] = finding
+		}
+	}
+
+	result := make([]model.Finding, 0, len(order))
+	for _, key := range order {
+		result = append(result, byLocation[key])
+	}
+	return result
+}
+
+func findingPriority(finding model.Finding) int {
+	priority := int(finding.Severity) * 100
+	switch {
+	case strings.HasPrefix(finding.RuleID, "credential."):
+		return priority + 50
+	case finding.RuleID == "terraform.sensitive-persisted":
+		return priority + 40
+	case finding.RuleID == "provider.sensitive-persisted":
+		return priority + 30
+	case finding.RuleID == "heuristic.nested-json-secret":
+		return priority + 20
+	case finding.RuleID == "resource.high-risk":
+		return priority + 10
+	default:
+		return priority
+	}
 }
 
 func (s Scanner) remediation(resourceType, path string) string {

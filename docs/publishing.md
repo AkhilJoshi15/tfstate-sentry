@@ -27,15 +27,16 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 The script clones the existing repository into a temporary directory, overlays this release tree, creates one commit, and pushes `main`.
 
-## Create the first release
+## Create a release
 
 After the CI and Security workflows pass:
 
 ```bash
 git clone https://github.com/AkhilJoshi15/tfstate-sentry.git
 cd tfstate-sentry
-git tag -a v0.1.0 -m "tfstate-sentry v0.1.0"
-git push origin v0.1.0
+make check-version
+git tag -a v0.2.0 -m "tfstate-sentry v0.2.0"
+git push origin v0.2.0
 ```
 
-The Release workflow builds Linux, macOS, and Windows archives, creates SHA-256 checksums, and publishes the GitHub release.
+The Release workflow reruns race tests, builds Linux, macOS, and Windows archives, creates an SPDX SBOM and SHA-256 checksums, signs artifacts with keyless Sigstore, and publishes the GitHub release. Verify that the tag matches `VERSION` before pushing it.

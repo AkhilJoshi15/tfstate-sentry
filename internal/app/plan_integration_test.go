@@ -68,6 +68,9 @@ output "secret" {
 	if _, err := os.Stat(filepath.Join(tempDir, ".tfstate-sentry", "manifest.json")); err != nil {
 		t.Fatalf("expected manifest file: %v", err)
 	}
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "tfplan"))
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "plan.json"))
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "provider-schema.json"))
 }
 
 func TestPlanCommandAllowsNonSensitivePlans(t *testing.T) {
@@ -109,6 +112,42 @@ output "demo" {
 	}
 	if !strings.Contains(stdout.String(), "No Terraform state exposures detected") {
 		t.Fatalf("expected clean report, got %q", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".tfstate-sentry", "tfplan")); err != nil {
+		t.Fatalf("expected approved plan to remain: %v", err)
+	}
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "plan.json"))
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "provider-schema.json"))
+}
+
+func TestPlanCommandDiscardPlanRemovesApprovedPlan(t *testing.T) {
+	_, err := exec.LookPath("terraform")
+	if err != nil {
+		t.Skip("terraform not installed")
+	}
+	tempDir := t.TempDir()
+	writeTerraformModule(t, tempDir, `output "demo" { value = "ordinary-value" }`)
+
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(previousDir)
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"plan", "--discard-plan", "--fail-on", "high"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("expected exit 0, got %d; stderr=%s", code, stderr.String())
+	}
+	assertMissing(t, filepath.Join(tempDir, ".tfstate-sentry", "tfplan"))
+}
+
+func assertMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed, stat error: %v", path, err)
 	}
 }
 

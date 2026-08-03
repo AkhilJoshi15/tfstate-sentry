@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -21,7 +22,9 @@ jobs:
           check-latest: true
           cache: true
       - name: Test
-        run: go test -race ./...
+        run: |
+          sh scripts/check-version.sh
+          go test -race ./...
       - name: Build release archives
         shell: bash
         run: |
@@ -63,7 +66,24 @@ jobs:
             rm -rf "${stage}"
           done
 
-          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/tfstate-sentry_${{ github.ref_name }}_sbom.spdx.json
+      - name: Generate checksums
+        shell: bash
+        run: (cd dist && sha256sum *.tar.gz *.zip *sbom*.json > checksums.txt)
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in dist/*.tar.gz dist/*.zip dist/checksums.txt dist/*sbom*.json; do
+            cosign sign-blob --yes --bundle "${artifact}.sigstore.json" "${artifact}"
+          done
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:

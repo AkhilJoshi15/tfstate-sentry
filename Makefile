@@ -1,7 +1,8 @@
-.PHONY: build test test-race fmt fmt-check vet scan-demo clean
+.PHONY: build test test-race fmt fmt-check vet check-version scan-demo clean
 
 BINARY := bin/tfstate-sentry
-VERSION ?= 0.2.0-dev
+RELEASE_VERSION := $(shell cat VERSION)
+VERSION ?= $(RELEASE_VERSION)-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -s -w \
@@ -27,6 +28,9 @@ fmt-check:
 
 vet:
 	go vet ./...
+
+check-version:
+	sh scripts/check-version.sh
 
 scan-demo: build
 	$(BINARY) scan --schema testdata/schema/provider-schema.json --fail-on none testdata/show-plan/unsafe.plan.json

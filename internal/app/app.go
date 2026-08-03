@@ -23,12 +23,13 @@ import (
 )
 
 type options struct {
-	input  string
-	chdir  string
-	schema string
-	format string
-	output string
-	failOn string
+	input       string
+	chdir       string
+	schema      string
+	format      string
+	output      string
+	failOn      string
+	discardPlan bool
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {
@@ -129,6 +130,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	set.StringVar(&opts.output, "output", "", "write report to a file instead of stdout")
 	set.StringVar(&opts.failOn, "fail-on", "high", "exit 3 when findings meet threshold: none, low, medium, high, critical")
 	set.StringVar(&opts.chdir, "chdir", "", "working directory for terraform plan")
+	set.BoolVar(&opts.discardPlan, "discard-plan", false, "delete the saved plan after scanning even when approved")
 	set.Usage = func() { planUsage(stderr) }
 	if err := set.Parse(args); err != nil {
 		return 2
@@ -153,7 +155,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	stateDir := filepath.Join(workingDirAbs, ".tfstate-sentry")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		fmt.Fprintf(stderr, "create state dir: %v\n", err)
 		return 1
 	}
@@ -161,6 +163,14 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	schemaPath := filepath.Join(stateDir, "provider-schema.json")
 	planJSONPath := filepath.Join(stateDir, "plan.json")
 	manifestPath := filepath.Join(stateDir, "manifest.json")
+	planApproved := false
+	defer func() {
+		_ = os.Remove(planJSONPath)
+		_ = os.Remove(schemaPath)
+		if !planApproved || opts.discardPlan {
+			_ = os.Remove(planPath)
+		}
+	}()
 
 	terraformPath, err := exec.LookPath("terraform")
 	if err != nil {
@@ -187,10 +197,24 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "terraform plan failed: %v\n%s", err, output)
 		return 1
 	}
-	schemaOutput, err := runTerraform(terraformPath, workingDirAbs, "providers", "schema", "-json")
-	if err != nil {
-		fmt.Fprintf(stderr, "terraform providers schema failed: %v\n%s", err, schemaOutput)
+	if err := os.Chmod(planPath, 0o600); err != nil {
+		fmt.Fprintf(stderr, "protect saved plan: %v\n", err)
 		return 1
+	}
+	var schemaOutput string
+	if opts.schema != "" {
+		schemaBytes, readErr := os.ReadFile(opts.schema)
+		if readErr != nil {
+			fmt.Fprintf(stderr, "read schema input: %v\n", readErr)
+			return 1
+		}
+		schemaOutput = string(schemaBytes)
+	} else {
+		schemaOutput, err = runTerraform(terraformPath, workingDirAbs, "providers", "schema", "-json")
+		if err != nil {
+			fmt.Fprintf(stderr, "terraform providers schema failed: %v\n%s", err, schemaOutput)
+			return 1
+		}
 	}
 	if err := os.WriteFile(schemaPath, []byte(schemaOutput), 0o600); err != nil {
 		fmt.Fprintf(stderr, "write schema output: %v\n", err)
@@ -275,6 +299,7 @@ func runPlan(args []string, stdout, stderr io.Writer) int {
 	if meetsThreshold(findings, threshold) {
 		return 3
 	}
+	planApproved = true
 	return 0
 }
 
@@ -379,7 +404,8 @@ Runs terraform init, terraform plan, terraform providers schema, and terraform s
 
 Flags:
   --chdir <path>        working directory for terraform plan (default: current directory)
-  --schema <path>       optional schema file to use instead of the generated provider schema
+  --discard-plan        delete the saved plan after a successful scan
+  --schema <path>       use an existing provider schema instead of querying Terraform
   --format <format>     text, json, or sarif (default: text)
   --output <path>       report destination; files are created with mode 0600
   --fail-on <severity>  none, low, medium, high, critical (default: high)`)
