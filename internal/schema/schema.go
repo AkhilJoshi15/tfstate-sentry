@@ -41,13 +41,15 @@ func Load(path string) (*Index, error) {
 	providers, _ := root["provider_schemas"].(map[string]any)
 	for _, providerValue := range providers {
 		provider, _ := providerValue.(map[string]any)
-		resources, _ := provider["resource_schemas"].(map[string]any)
-		for resourceType, resourceValue := range resources {
-			resource, _ := resourceValue.(map[string]any)
-			block, _ := resource["block"].(map[string]any)
-			attrs := map[string]Attribute{}
-			walkBlock(block, "", attrs)
-			index.Resources[resourceType] = attrs
+		for _, schemaKind := range []string{"resource_schemas", "data_source_schemas"} {
+			schemas, _ := provider[schemaKind].(map[string]any)
+			for schemaType, schemaValue := range schemas {
+				schema, _ := schemaValue.(map[string]any)
+				block, _ := schema["block"].(map[string]any)
+				attrs := map[string]Attribute{}
+				walkBlock(block, "", attrs)
+				index.Resources[schemaType] = attrs
+			}
 		}
 	}
 

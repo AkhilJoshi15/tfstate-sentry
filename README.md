@@ -27,12 +27,41 @@ Terraform can mark values as sensitive to hide them in normal terminal output wh
 - deterministic fingerprints that never include secret values
 - tfstate-sentry sends no telemetry and makes no direct network requests. Terraform itself may contact configured backends, providers, and cloud APIs.
 
-## Install
+## One-command plan gate
 
-Install from source after the first tagged release or build locally from the repository:
+Run the one-command workflow from a trusted CI runner or workstation:
 
 ```bash
-go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@latest
+tfstate-sentry plan --fail-on high -- -var-file=prod.tfvars
+```
+
+The command does the following:
+
+1. Runs `terraform plan`
+2. Retrieves the provider schema
+3. Converts the saved plan to JSON in memory
+4. Scans for persisted confidential values
+5. Deletes rejected plans
+6. Retains approved plans for `terraform apply`
+
+After a successful scan, apply the retained plan with:
+
+```bash
+terraform apply .tfstate-sentry/tfplan
+```
+
+For audit-only behavior that discards the plan after scanning, use:
+
+```bash
+tfstate-sentry plan --discard-plan --fail-on high
+```
+
+## Install
+
+Download a prebuilt binary from GitHub Releases, or install with Go:
+
+```bash
+go install github.com/AkhilJoshi15/tfstate-sentry/cmd/tfstate-sentry@v0.1.0
 ```
 
 ## Build
@@ -44,16 +73,16 @@ make build
 ./bin/tfstate-sentry version
 ```
 
-## Safe usage
+## Advanced: scan existing artifacts
 
-Create a saved plan and provider schema inside the same trusted CI runner:
+If you already have Terraform artifacts on disk, you can scan them explicitly:
 
 ```bash
 terraform plan -out=tfplan
 terraform show -json tfplan > tfplan.json
 terraform providers schema -json > provider-schema.json
 
-./tfstate-sentry scan \
+./bin/tfstate-sentry scan \
   --schema provider-schema.json \
   --fail-on high \
   tfplan.json
@@ -61,16 +90,55 @@ terraform providers schema -json > provider-schema.json
 rm -f tfplan tfplan.json provider-schema.json
 ```
 
-Never commit plan, state, or generated JSON files. Terraform plan and state JSON can contain secrets in plaintext.
-
-tfstate-sentry detects exposure. It does not encrypt, redact, or modify Terraform state.
-
 Scan from stdin to avoid writing plan JSON to disk:
 
 ```bash
 terraform show -json tfplan | \
-  ./tfstate-sentry scan --schema provider-schema.json -
+  ./bin/tfstate-sentry scan --schema provider-schema.json -
 ```
+
+## Example result
+
+```text
+HIGH  terraform.sensitive-persisted
+Resource:    aws_db_instance.main
+Path:        password
+Finding:     A Terraform-sensitive value is persisted in plan or state data.
+Remediation: Replace password with provider-supported write-only argument password_wo and supply it from an ephemeral value where possible.
+Value:       [REDACTED]
+```
+
+## CI usage
+
+Use the one-command workflow in GitHub Actions or another CI system:
+
+```yaml
+steps:
+  - uses: actions/checkout@v6
+  - uses: actions/setup-go@v7
+    with:
+      go-version: '1.26.x'
+      check-latest: true
+      cache: true
+  - run: make build
+  - run: ./bin/tfstate-sentry plan --fail-on high -- -var-file=prod.tfvars
+```
+
+## Security model
+
+Never commit plan, state, or generated JSON files. Terraform plan and state JSON can contain secrets in plaintext.
+
+tfstate-sentry detects exposure. It does not encrypt, redact, or modify Terraform state.
+
+Approved binary plans can still contain secrets. Terraform explicitly states that saved plans include full values, including sensitive data in cleartext.
+
+## Limitations
+
+- tfstate-sentry detects exposure; it does not encrypt or remove secrets from existing state.
+- Provider write-only support varies by provider and version.
+- Approved binary plans can still contain plaintext values.
+- Detection may produce false positives.
+- Early releases should use synthetic or approved test data.
 
 ## Demo
 
@@ -105,7 +173,7 @@ Value:       [REDACTED]
 ## SARIF
 
 ```bash
-./tfstate-sentry scan \
+./bin/tfstate-sentry scan \
   --schema provider-schema.json \
   --format sarif \
   --output tfstate-sentry.sarif \
@@ -126,18 +194,9 @@ make build
 
 See [the threat model](docs/threat-model.md), [clean-room rules](docs/clean-room-development.md), [publishing guide](docs/publishing.md), [security policy](SECURITY.md), and [contribution guide](CONTRIBUTING.md).
 
-## Roadmap
-
-- baseline mode to block only newly introduced exposure
-- richer provider-version-aware remediation catalog
-- source mapping from Terraform configuration to findings
-- GitHub Action and reusable workflow
-- OpenTofu compatibility matrix
-- provider coverage benchmark
-
 ## Releases
 
-Pushing a semantic version tag such as `v0.1.0` runs tests, cross-compiles Linux, macOS, and Windows binaries, publishes SHA-256 checksums, and creates a GitHub release.
+The initial v0.1.0 release is available from GitHub Releases. Future semantic-version tags automatically run tests, cross-compile binaries, generate checksums, and publish a release.
 
 ## License
 

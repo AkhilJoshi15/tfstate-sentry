@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/AkhilJoshi15/tfstate-sentry/internal/model"
 	"github.com/AkhilJoshi15/tfstate-sentry/internal/parser"
 	providerschema "github.com/AkhilJoshi15/tfstate-sentry/internal/schema"
 )
@@ -60,5 +61,40 @@ func TestScanDetectsPrivateKey(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected private-key finding")
+	}
+}
+
+func TestScanFindsListSensitivePathsAndDataSourceSchema(t *testing.T) {
+	schema := providerschema.Empty()
+	schema.Resources["data.aws_secretsmanager_secret"] = map[string]providerschema.Attribute{
+		"credentials.password": {Sensitive: true},
+	}
+
+	resource := model.Resource{
+		Address: "data.aws_secretsmanager_secret.example",
+		Type:    "data.aws_secretsmanager_secret",
+		Values: map[string]any{
+			"credentials": []any{map[string]any{"password": "super-secret"}},
+		},
+		SensitiveValues: map[string]any{
+			"credentials": []any{map[string]any{"password": true}},
+		},
+	}
+
+	findings := Scanner{Schema: schema}.Scan([]model.Resource{resource})
+	if len(findings) == 0 {
+		t.Fatal("expected findings")
+	}
+
+	found := false
+	for _, finding := range findings {
+		if finding.Path == "credentials.[0].password" && finding.RuleID == "terraform.sensitive-persisted" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		b, _ := json.Marshal(findings)
+		t.Fatalf("expected list-based sensitive-path finding, got %s", string(b))
 	}
 }
